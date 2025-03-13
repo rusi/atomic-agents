@@ -1,6 +1,6 @@
 import instructor
 from pydantic import BaseModel, Field
-from typing import Optional, Type
+from typing import Optional, Type, List, Dict, Any, Callable
 from atomic_agents.lib.components.agent_memory import AgentMemory
 from atomic_agents.lib.components.system_prompt_generator import (
     SystemPromptContextProviderBase,
@@ -77,6 +77,13 @@ class BaseAgentConfig(BaseModel):
         description="Maximum number of token allowed in the response generation.",
     )
     model_api_parameters: Optional[dict] = Field(None, description="Additional parameters passed to the API provider.")
+    tools: Optional[List[Dict[str, Any]]] = Field(None, description="List of tools that can be used by the agent.")
+    tool_choice: Optional[str] = Field(
+        None, description="Controls which (if any) tool is called by the model. Options: 'none', 'auto', or a specific tool."
+    )
+    tool_handlers: Optional[Dict[str, Callable]] = Field(
+        None, description="Dictionary mapping tool names to their handler functions."
+    )
 
 
 class BaseAgent:
@@ -100,6 +107,9 @@ class BaseAgent:
         max_tokens (int): Maximum number of tokens allowed in the response.
             DEPRECATED: Include 'max_tokens' in model_api_parameters instead.
         model_api_parameters (dict): Additional parameters passed to the API provider.
+        tools (List[Dict[str, Any]]): List of tools that can be used by the agent.
+        tool_choice (str): Controls which (if any) tool is called by the model.
+        tool_handlers (Dict[str, Callable]): Dictionary mapping tool names to their handler functions.
     """
 
     input_schema = BaseAgentInputSchema
@@ -121,6 +131,10 @@ class BaseAgent:
         self.initial_memory = self.memory.copy()
         self.current_user_input = None
         self.model_api_parameters = config.model_api_parameters or {}
+        self.tools = config.tools or []
+        self.tool_choice = config.tool_choice
+        self.tool_handlers = config.tool_handlers or {}
+
         if config.temperature is not None:
             warnings.warn(
                 "'temperature' is deprecated and will soon be removed. Please use 'model_api_parameters' instead.",
@@ -162,14 +176,50 @@ class BaseAgent:
             }
         ] + self.memory.get_history()
 
+        # Prepare API parameters with tools if available
+        api_params = self.model_api_parameters.copy()
+        if self.tools:
+            api_params["tools"] = self.tools
+            if self.tool_choice:
+                api_params["tool_choice"] = self.tool_choice
+
         response = self.client.chat.completions.create(
             messages=messages,
             model=self.model,
             response_model=response_model,
-            **self.model_api_parameters,
+            **api_params,
         )
 
+        # Handle tool calls if present in the response
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            self._handle_tool_calls(response)
+
         return response
+
+    def _handle_tool_calls(self, response):
+        """
+        Handles tool calls in the response.
+
+        Args:
+            response (BaseModel): The response containing tool calls.
+        """
+        if not hasattr(response, "tool_calls") or not response.tool_calls:
+            return
+
+        for tool_call in response.tool_calls:
+            tool_name = tool_call.function.name
+            tool_arguments = tool_call.function.arguments
+
+            if tool_name in self.tool_handlers:
+                # Execute the tool handler
+                tool_result = self.tool_handlers[tool_name](**tool_arguments)
+
+                # Add the tool call and result to memory
+                self.memory.add_message("assistant", {"role": "assistant", "tool_calls": [tool_call.model_dump()]})
+
+                self.memory.add_message(
+                    "tool", {"role": "tool", "tool_call_id": tool_call.id, "name": tool_name, "content": str(tool_result)}
+                )
 
     def run(self, user_input: Optional[BaseIOSchema] = None) -> BaseIOSchema:
         """
@@ -213,11 +263,18 @@ class BaseAgent:
             }
         ] + self.memory.get_history()
 
+        # Prepare API parameters with tools if available
+        api_params = self.model_api_parameters.copy()
+        if self.tools:
+            api_params["tools"] = self.tools
+            if self.tool_choice:
+                api_params["tool_choice"] = self.tool_choice
+
         response_stream = self.client.chat.completions.create_partial(
             model=self.model,
             messages=messages,
             response_model=self.output_schema,
-            **self.model_api_parameters,
+            **api_params,
             stream=True,
         )
 
@@ -225,6 +282,11 @@ class BaseAgent:
             yield partial_response
 
         full_response_content = self.output_schema(**partial_response.model_dump())
+
+        # Handle tool calls in the final response if present
+        if hasattr(full_response_content, "tool_calls") and full_response_content.tool_calls:
+            self._handle_tool_calls(full_response_content)
+
         self.memory.add_message("assistant", full_response_content)
 
     async def stream_response_async(self, user_input: Optional[Type[BaseIOSchema]] = None):
@@ -283,6 +345,46 @@ class BaseAgent:
             del self.system_prompt_generator.context_providers[provider_name]
         else:
             raise KeyError(f"Context provider '{provider_name}' not found.")
+
+    def register_tool(self, tool_definition: Dict[str, Any], handler: Callable):
+        """
+        Registers a new tool with the agent.
+
+        Args:
+            tool_definition (Dict[str, Any]): The tool definition in OpenAI format.
+            handler (Callable): The function that handles the tool call.
+        """
+        if not self.tools:
+            self.tools = []
+
+        # Check if tool already exists
+        for i, tool in enumerate(self.tools):
+            if tool.get("function", {}).get("name") == tool_definition.get("function", {}).get("name"):
+                # Replace existing tool
+                self.tools[i] = tool_definition
+                self.tool_handlers[tool_definition["function"]["name"]] = handler
+                return
+
+        # Add new tool
+        self.tools.append(tool_definition)
+        self.tool_handlers[tool_definition["function"]["name"]] = handler
+
+    def unregister_tool(self, tool_name: str):
+        """
+        Unregisters a tool from the agent.
+
+        Args:
+            tool_name (str): The name of the tool to unregister.
+        """
+        if not self.tools:
+            return
+
+        # Remove tool from tools list
+        self.tools = [tool for tool in self.tools if tool.get("function", {}).get("name") != tool_name]
+
+        # Remove handler
+        if tool_name in self.tool_handlers:
+            del self.tool_handlers[tool_name]
 
 
 if __name__ == "__main__":
