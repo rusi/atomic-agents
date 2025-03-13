@@ -204,6 +204,80 @@ def test_base_io_schema_model_json_schema_no_description():
     assert schema["description"] == "Test schema docstring."
 
 
+def test_handle_tool_calls(agent, mock_memory):
+    # Create a mock response with tool calls
+    mock_tool_call = Mock()
+    mock_tool_call.id = "tool_call_123"
+    mock_tool_call.function.name = "test_tool"
+    mock_tool_call.function.arguments = {"arg1": "value1"}
+    mock_tool_call.model_dump.return_value = {
+        "id": "tool_call_123",
+        "function": {"name": "test_tool", "arguments": {"arg1": "value1"}},
+    }
+
+    mock_response = Mock()
+    mock_response.tool_calls = [mock_tool_call]
+
+    # Set up a mock tool handler
+    mock_tool_handler = Mock(return_value="Tool result")
+    agent.tool_handlers = {"test_tool": mock_tool_handler}
+
+    # Call the method being tested
+    agent._handle_tool_calls(mock_response)
+
+    # Verify the tool handler was called with the correct arguments
+    mock_tool_handler.assert_called_once_with(arg1="value1")
+
+    # Verify the tool call and result were added to memory
+    mock_memory.add_message.assert_has_calls(
+        [
+            call("assistant", {"role": "assistant", "tool_calls": [mock_tool_call.model_dump()]}),
+            call("tool", {"role": "tool", "tool_call_id": "tool_call_123", "name": "test_tool", "content": "Tool result"}),
+        ]
+    )
+
+
+def test_get_response_with_tools(agent, mock_memory, mock_instructor):
+    # Set up tools and tool handlers
+    agent.tools = [{"type": "function", "function": {"name": "test_tool", "description": "A test tool"}}]
+    agent.tool_choice = "auto"
+    agent.tool_handlers = {"test_tool": Mock(return_value="Tool result")}
+
+    # Create a mock response with tool calls
+    mock_tool_call = Mock()
+    mock_tool_call.id = "tool_call_456"
+    mock_tool_call.function.name = "test_tool"
+    mock_tool_call.function.arguments = {"param": "test"}
+    mock_tool_call.model_dump.return_value = {
+        "id": "tool_call_456",
+        "function": {"name": "test_tool", "arguments": {"param": "test"}},
+    }
+
+    mock_response = Mock()
+    mock_response.tool_calls = [mock_tool_call]
+    mock_instructor.chat.completions.create.return_value = mock_response
+
+    # Call the method being tested
+    response = agent.get_response()
+
+    # Verify the API was called with the correct parameters
+    mock_instructor.chat.completions.create.assert_called_once()
+    call_kwargs = mock_instructor.chat.completions.create.call_args.kwargs
+    assert "tools" in call_kwargs
+    assert call_kwargs["tools"] == agent.tools
+    assert "tool_choice" in call_kwargs
+    assert call_kwargs["tool_choice"] == "auto"
+
+    # Verify tool handling was performed
+    assert response == mock_response
+    mock_memory.add_message.assert_has_calls(
+        [
+            call("assistant", {"role": "assistant", "tool_calls": [mock_tool_call.model_dump()]}),
+            call("tool", {"role": "tool", "tool_call_id": "tool_call_456", "name": "test_tool", "content": "Tool result"}),
+        ]
+    )
+
+
 @pytest.mark.asyncio
 async def test_run_async(agent, mock_memory):
     mock_input = BaseAgentInputSchema(chat_message="Test input")
